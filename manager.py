@@ -1,87 +1,78 @@
 # manager.py
-# Gestionnaire de connexions WebSocket par room.
-# Permet d'envoyer des messages à tous les sockets connectés à une room.
-# Ajout : gestion des usernames réservés et libération à la déconnexion.
-
-from typing import Dict, Set, Optional
+from typing import Dict, Set, List, Tuple
 from fastapi import WebSocket
 import asyncio
 import json
-import threading
 
 class ConnectionManager:
     def __init__(self):
-        # mapping room_name -> set of websockets
-        self.active_connections: Dict[str, Set[WebSocket]] = {}
-        # mapping websocket -> username (to know which username to release)
-        self.ws_to_username: Dict[WebSocket, str] = {}
-        # set of usernames currently reserved/taken by active connections
-        self.taken_usernames: Set[str] = set()
-        # lock to protect taken_usernames and ws_to_username
-        self._lock = threading.Lock()
+        # room_name -> set of websockets
+        self.rooms: Dict[str, Set[WebSocket]] = {}
+        # username -> set of websocket ids
+        self.username_map: Dict[str, Set[int]] = {}
+        # websocket id -> (room_name, username)
+        self.ws_meta: Dict[int, Tuple[str, str]] = {}
+        self._lock = asyncio.Lock()
 
-    async def connect(self, room: str, websocket: WebSocket, username: Optional[str] = None):
-        """
-        Accept websocket and register it in the room.
-        Optionally associate a username with this websocket (for release on disconnect).
-        """
+    async def connect(self, room: str, websocket: WebSocket, username: str):
         await websocket.accept()
-        conns = self.active_connections.setdefault(room, set())
-        conns.add(websocket)
-        if username:
-            with self._lock:
-                self.ws_to_username[websocket] = username
-                self.taken_usernames.add(username)
+        async with self._lock:
+            self.rooms.setdefault(room, set()).add(websocket)
+            self.username_map.setdefault(username, set()).add(id(websocket))
+            self.ws_meta[id(websocket)] = (room, username)
 
     def disconnect(self, room: str, websocket: WebSocket):
-        """
-        Remove websocket from room and cleanup username mapping.
-        """
-        conns = self.active_connections.get(room)
-        if conns and websocket in conns:
-            conns.remove(websocket)
-            if not conns:
-                del self.active_connections[room]
-        # cleanup username mapping
-        with self._lock:
-            username = self.ws_to_username.pop(websocket, None)
-            if username and username in self.taken_usernames:
-                self.taken_usernames.discard(username)
+        try:
+            if room in self.rooms and websocket in self.rooms[room]:
+                self.rooms[room].remove(websocket)
+                if not self.rooms[room]:
+                    del self.rooms[room]
+        except Exception:
+            pass
+        meta = self.ws_meta.pop(id(websocket), None)
+        if meta:
+            _, username = meta
+            ids = self.username_map.get(username)
+            if ids:
+                ids.discard(id(websocket))
+                if not ids:
+                    # no more sockets for this username
+                    del self.username_map[username]
 
-    async def broadcast(self, room: str, message: dict):
-        conns = list(self.active_connections.get(room, []))
-        if not conns:
-            return
-        data = json.dumps(message, default=str)
-        # send concurrently
-        await asyncio.gather(*(ws.send_text(data) for ws in conns))
-
-    # --- username reservation API (thread-safe) ---
     def reserve_username(self, username: str) -> bool:
         """
-        Try to reserve a username. Returns True if reserved, False if already taken.
+        Reserve a username for a live connection.
+        By default this implementation allows multiple sockets per username.
+        If you want to prevent duplicates, change this to return False when
+        username_map[username] is non-empty.
         """
-        with self._lock:
-            if username in self.taken_usernames:
-                return False
-            self.taken_usernames.add(username)
-            return True
+        self.username_map.setdefault(username, set())
+        return True
 
     def release_username(self, username: str):
         """
-        Release a previously reserved username.
+        Release a username reservation if no sockets remain for it.
+        Safe to call even if username not present.
         """
-        with self._lock:
-            self.taken_usernames.discard(username)
-            # also remove any websocket mapping that still references it
-            to_remove = [ws for ws, u in self.ws_to_username.items() if u == username]
-            for ws in to_remove:
-                self.ws_to_username.pop(ws, None)
-
-    def get_taken_usernames(self) -> Set[str]:
-        with self._lock:
-            return set(self.taken_usernames)
+        ids = self.username_map.get(username)
+        if ids is None or len(ids) == 0:
+            self.username_map.pop(username, None)
 
     def is_username_taken(self, username: str) -> bool:
-        with self._lock:
-            return username in self.taken_usernames
+        return username in self.username_map and len(self.username_map[username]) > 0
+
+    async def broadcast(self, room: str, message: dict):
+        conns = list(self.rooms.get(room, []))
+        try:
+            text = json.dumps(message)
+        except Exception:
+            text = str(message)
+        for ws in conns:
+            try:
+                await ws.send_text(text)
+            except Exception:
+                # ignore send errors; cleanup happens on disconnect
+                pass
+
+    def get_taken_usernames(self) -> List[str]:
+        return [u for u, s in self.username_map.items() if s]

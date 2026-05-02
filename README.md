@@ -29,6 +29,8 @@ eval/
 
 ### Installer ce qu'il faut
 Ouvrir un bash puis copier cette ligne : pip install -r requirements.txt  
+Il y aura sans doute un message d'erreur pour un des modules, ça ne fait rien.  
+(il faut éventuellement faire un pip install sqlalchemy manuellement)  
 (le fichier requirements.txt comprend tout ce qui est nécessaire pour le bon fonctionnement du code)
 
 ### Ouvrir le client

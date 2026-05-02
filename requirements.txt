@@ -4,3 +4,4 @@ SQLAlchemy==2.1.0
 databases==0.6.0
 aiosqlite==0.18.0
 python-multipart==0.0.6
+sqlalchemy==2.1.0

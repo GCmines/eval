@@ -3,104 +3,202 @@
 <html>
 <head>
   <meta charset="utf-8" />
+  <link rel="stylesheet" href="/static/styles.css">
   <title>Mini WhatsApp - Chat</title>
-  <style>
-    body { font-family: Arial, sans-serif; margin: 20px; }
-    #messages { border: 1px solid #ddd; height: 400px; overflow:auto; padding: 8px; border-radius:6px; }
-    .msg { margin-bottom: 8px; }
-    .meta { color: #666; font-size: 12px; }
-    input, button { padding: 8px; margin: 4px; }
-    /* modal styles */
-    .modal-backdrop { position:fixed; left:0; top:0; width:100%; height:100%; background:rgba(0,0,0,0.4); display:flex; align-items:center; justify-content:center; z-index:9999; }
-    .modal-box { background:#fff; padding:20px; border-radius:6px; min-width:320px; box-shadow:0 4px 12px rgba(0,0,0,0.15); }
-    .modal-box h3 { margin:0 0 10px 0; }
-    .modal-actions { text-align:right; margin-top:10px; }
-  </style>
 </head>
 <body>
-  <h1 id="title">Chat</h1>
-  <div id="messages"></div>
-  <div>
-    <input id="content" placeholder="Type a message" style="width:70%" />
-    <button id="sendBtn">Send</button>
-    <button id="leaveBtn">Leave</button>
+  <div class="topbar">
+    <div class="brand"><span class="dot"></span>Mounier & Chupin vous présentent leur messagerie</div>
+  </div>
+
+  <div class="app">
+    <aside class="panel lobby">
+      <h2 class="center">Rooms</h2>
+
+      <div class="box">
+        <h3>Rooms</h3>
+        <ul id="roomsList"></ul>
+        <button id="refreshRoomsBtn">Refresh</button>
+      </div>
+
+      <div class="box">
+        <h3>Utilisateur</h3>
+        <div class="small">User: <strong id="currentUser">—</strong></div>
+        <div style="margin-top:8px;">
+          <button id="leaveBtn">Leave</button>
+        </div>
+      </div>
+
+      <div class="credit">messagerie de Mounier & Chupin</div>
+    </aside>
+
+    <main class="panel chat">
+      <div class="header">
+        <div>
+          <div class="title" id="roomTitle">—</div>
+          <div class="sub" id="roomSub">—</div>
+        </div>
+        <div class="small">On a tenté de reproduire un petit style Matrix</div>
+      </div>
+
+      <div id="messages"></div>
+
+      <div class="composer">
+        <input id="content" type="text" placeholder="Tapez votre message..." />
+        <button id="sendBtn">Send</button>
+      </div>
+    </main>
   </div>
 
 <script>
+/* utilities */
 function qs(name){
   const params = new URLSearchParams(location.search);
   return params.get(name);
 }
+function el(id){ return document.getElementById(id); }
+
+/* state */
 let user = qs('user');
 const room = qs('room');
+const messagesEl = el('messages');
+const currentUserEl = el('currentUser');
+const roomTitleEl = el('roomTitle');
+const roomSubEl = el('roomSub');
+let ws = null;
 
-if (!room) {
-  document.body.innerHTML = '<p>Room not specified. Open this page with ?room=ROOM_NAME (index.html should link here).</p>';
-} else {
-  document.getElementById('title').innerText = `Room: ${room} — User: ${user || 'selecting...'}`;
+/* header */
+function setHeader(u, r){
+  currentUserEl.textContent = u || '—';
+  roomTitleEl.textContent = r || '—';
+  roomSubEl.textContent = u ? `Connected as ${u}` : 'Not connected';
 }
 
-const messagesEl = document.getElementById('messages');
+/* build DOM node for a message (supports pending marker) */
+function buildMessageNode(m){
+  const wrapper = document.createElement('div');
+  wrapper.className = 'msg ' + (m.user_name === user ? 'me' : 'other');
+  if (m.__pending) wrapper.classList.add('pending');
+  if (m.__pendingId) wrapper.dataset.pendingId = m.__pendingId;
 
-function addMessage(m){
-  const div = document.createElement('div');
-  div.className = 'msg';
   const meta = document.createElement('div');
   meta.className = 'meta';
-  meta.innerText = `${m.user_name} • ${new Date(m.created_at).toLocaleString()}`;
-  const content = document.createElement('div');
-  content.innerText = m.content;
-  div.appendChild(meta);
-  div.appendChild(content);
-  messagesEl.appendChild(div);
+  let displayTime = '';
+  try {
+    displayTime = new Date(m.created_at).toLocaleString('fr-FR', { timeZone: 'Europe/Paris' });
+  } catch(e) {
+    displayTime = m.created_at || '';
+  }
+  meta.textContent = `${m.user_name} • ${displayTime}`;
+
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  bubble.textContent = m.content;
+
+  wrapper.appendChild(meta);
+  wrapper.appendChild(bubble);
+  return wrapper;
+}
+
+/* appendMessage with deduplication: replace pending when server message arrives */
+function appendMessage(m){
+  const isPending = !!m.__pending;
+  if (!isPending) {
+    // try to find a matching pending message (same user + same content)
+    const pendingNodes = Array.from(messagesEl.querySelectorAll('.msg.pending'));
+    for (const node of pendingNodes) {
+      const bubble = node.querySelector('.bubble');
+      const meta = node.querySelector('.meta');
+      if (!bubble || !meta) continue;
+      const pendingContent = bubble.textContent;
+      const pendingUser = meta.textContent.split(' • ')[0];
+      if (pendingUser === m.user_name && pendingContent === m.content) {
+        const newNode = buildMessageNode(m);
+        node.replaceWith(newNode);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+        return;
+      }
+    }
+  }
+  const node = buildMessageNode(m);
+  messagesEl.appendChild(node);
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
+/* load history from server */
 async function loadHistory(){
-  const res = await fetch(`/rooms/${encodeURIComponent(room)}/messages`);
-  if (!res.ok) return;
-  const data = await res.json();
-  (data || []).forEach(addMessage);
+  if (!room) return;
+  try {
+    const res = await fetch(`/rooms/${encodeURIComponent(room)}/messages`);
+    if (!res.ok) return;
+    const data = await res.json();
+    messagesEl.innerHTML = '';
+    (data || []).forEach(appendMessage);
+  } catch(e){
+    console.warn('loadHistory error', e);
+  }
 }
 
-let ws;
+/* WebSocket connection */
 function connectWS(chosenUser){
   user = chosenUser || user;
-  document.getElementById('title').innerText = `Room: ${room} — User: ${user}`;
+  setHeader(user, room);
   const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${protocol}://${location.host}/ws/${encodeURIComponent(user)}/${encodeURIComponent(room)}`);
+
   ws.onopen = () => console.log('ws open');
   ws.onmessage = (ev) => {
     try {
       const payload = JSON.parse(ev.data);
-      if(payload.error){
+      if (payload.error) {
         alert('WebSocket error: ' + payload.error);
         return;
       }
-      if(payload.info){
+      if (payload.info) {
         console.log(payload.info);
         return;
       }
-      addMessage(payload);
+      appendMessage(payload);
     } catch(e){
-      console.log('raw', ev.data);
+      console.log('raw ws', ev.data);
     }
   };
   ws.onclose = () => console.log('ws closed');
   ws.onerror = (e) => console.error('ws error', e);
 }
 
-document.getElementById('sendBtn').addEventListener('click', send);
-document.getElementById('leaveBtn').addEventListener('click', leave);
-
+/* send with pending echo and deduplication */
 function send(){
-  const content = document.getElementById('content').value.trim();
-  if(!content || !ws || ws.readyState !== WebSocket.OPEN) return;
-  // send as JSON
-  ws.send(JSON.stringify({content}));
-  document.getElementById('content').value = '';
+  const input = el('content');
+  const text = input.value.trim();
+  if (!text) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    alert('WebSocket non connecté');
+    return;
+  }
+
+  // create a local pending message
+  const pendingMsg = {
+    id: null,
+    user_name: user,
+    room_name: room,
+    content: text,
+    created_at: new Date().toISOString(),
+    __pending: true,
+    __pendingId: 'p_' + Date.now().toString(36) + '_' + Math.floor(Math.random()*10000).toString(36)
+  };
+  appendMessage(pendingMsg);
+
+  // send to server
+  try {
+    ws.send(JSON.stringify({ content: text }));
+  } catch (e) {
+    console.error('WS send error', e);
+  }
+  input.value = '';
 }
 
+/* leave room */
 async function leave(){
   if (ws) ws.close();
   if (user) {
@@ -114,12 +212,11 @@ async function leave(){
       console.warn('leave error', e);
     }
   }
-  // redirect to index or static page
   window.location = '/static/index.html';
 }
 
-/* Modal helper */
-function showModalSelect(title, options) {
+/* modal to choose username */
+function showModalSelect(title, options){
   return new Promise(resolve => {
     const backdrop = document.createElement('div');
     backdrop.className = 'modal-backdrop';
@@ -145,27 +242,30 @@ function showModalSelect(title, options) {
   });
 }
 
-/* Flow: if user not provided in query, fetch available usernames and prompt selection,
-   then call /join to reserve and subscribe, then open WS and load history. */
-async function init() {
-  if (!room) return;
+/* initialization flow */
+async function init(){
+  if (!room) {
+    document.body.innerHTML = '<p style="padding:24px">Room not specified. Retournez au lobby et sélectionnez une room.</p>';
+    return;
+  }
+  setHeader(user, room);
+
   if (!user) {
     try {
       const res = await fetch('/available_usernames');
       if (!res.ok) throw new Error('failed to fetch usernames');
       const data = await res.json();
-      const usernames = data.available_usernames || [];
-      if (usernames.length === 0) {
-        alert('Aucun username disponible pour le moment. Créez-en un via /users ou réessayez plus tard.');
+      const list = data.available_usernames || [];
+      if (list.length === 0) {
+        alert('Aucun username disponible. Créez-en un via le lobby.');
         window.location = '/static/index.html';
         return;
       }
-      const choice = await showModalSelect('Choisissez un username', usernames);
+      const choice = await showModalSelect('Choisissez un username', list);
       if (!choice) {
         window.location = '/static/index.html';
         return;
       }
-      // call /join to reserve username and subscribe
       const joinRes = await fetch('/join', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
@@ -173,14 +273,13 @@ async function init() {
       });
       if (joinRes.status === 409) {
         alert('Ce username a été pris entre-temps. Réessayez.');
-        return init(); // retry
+        return init();
       }
       if (!joinRes.ok) {
         const err = await joinRes.json().catch(()=>({detail:'Erreur'}));
         alert('Erreur: ' + (err.detail || 'Impossible de rejoindre'));
         return;
       }
-      // success: open WS and load history
       connectWS(choice);
       await loadHistory();
     } catch (e) {
@@ -188,12 +287,48 @@ async function init() {
       alert('Erreur réseau ou serveur. Voir la console.');
     }
   } else {
-    // user provided in query: assume already reserved; open WS
     connectWS(user);
     await loadHistory();
   }
+
+  // populate rooms list for sidebar convenience
+  refreshRooms();
 }
 
+/* refresh rooms for sidebar */
+async function refreshRooms(){
+  try {
+    const res = await fetch('/rooms');
+    if (!res.ok) return;
+    const rooms = await res.json();
+    const ul = el('roomsList');
+    ul.innerHTML = '';
+    (rooms || []).forEach(r => {
+      const li = document.createElement('li');
+      li.className = 'room-item';
+      const name = document.createElement('div'); name.className = 'name'; name.textContent = r.name;
+      const meta = document.createElement('div'); meta.className = 'meta'; meta.textContent = '';
+      li.appendChild(name);
+      li.appendChild(meta);
+      li.onclick = () => {
+        if (!user) return alert('Sélectionnez d\'abord un username');
+        if (r.name === room) return;
+        window.location = `/static/chat.html?user=${encodeURIComponent(user)}&room=${encodeURIComponent(r.name)}`;
+      };
+      ul.appendChild(li);
+    });
+  } catch(e){
+    console.warn('refreshRooms error', e);
+  }
+}
+
+/* event wiring */
+el('sendBtn').addEventListener('click', send);
+el('content').addEventListener('keydown', (e) => { if (e.key === 'Enter') send(); });
+el('leaveBtn').addEventListener('click', leave);
+el('refreshRoomsBtn').addEventListener('click', refreshRooms);
+
+/* start */
 init();
 </script>
 </body>
